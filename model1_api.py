@@ -10,6 +10,7 @@
 # ============================================================
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware        # ← NEW
 from pydantic import BaseModel, Field
 import joblib
 import pandas as pd
@@ -22,8 +23,15 @@ app = FastAPI(
     description="Predicts demand (number of orders) for the next 1-hour slot at a print vendor.",
     version="1.0.0"
 )
-# FastAPI() = creates the web server app
-# title, description, version = shows up in the auto docs at /docs
+
+# ── CORS: allow React app to call this API ───────────────────  ← NEW
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # allow all origins (localhost, deployed site, etc.)
+    allow_credentials=True,
+    allow_methods=["*"],        # allow GET, POST, etc.
+    allow_headers=["*"],        # allow all headers
+)
 
 
 # ── Load the trained model when server starts ────────────────
@@ -36,19 +44,13 @@ if not os.path.exists(MODEL_PATH):
     )
 
 model = joblib.load(MODEL_PATH)
-# joblib.load() = loads the saved model from the .pkl file
-# this runs ONCE when the server starts — not on every request
 print(f"✓ Model loaded from {MODEL_PATH}")
 
 
 # ── Define what the INPUT should look like ───────────────────
 class DemandRequest(BaseModel):
-    # BaseModel = pydantic class that validates incoming data
-    # Field() = lets us add description and example values
-
     vendor_id: int = Field(
-        ...,                          # ... means this field is required
-        ge=1, le=5,                   # ge=greater or equal, le=less or equal
+        ..., ge=1, le=5,
         description="Vendor ID (1=main building, 2=library, 3=hostel, 4=science, 5=canteen)",
         example=1
     )
@@ -104,8 +106,6 @@ class DemandResponse(BaseModel):
 
 # ── Helper function: demand class + recommendation ───────────
 def get_demand_info(predicted_orders: int):
-    # converts a number into a class label and advice
-
     if predicted_orders <= 5:
         demand_class   = "Low"
         recommendation = "Normal operations. 1-2 printers sufficient."
@@ -116,19 +116,13 @@ def get_demand_info(predicted_orders: int):
         demand_class   = "High"
         recommendation = "Peak demand incoming! Activate all printers and alert staff."
 
-    # peak_level: normalise to 0.0–1.0 scale
-    # this number gets passed to Model 2 as 'predicted_demand'
-    # we clip at 40 as that's our realistic max
     peak_level = round(min(predicted_orders / 40.0, 1.0), 3)
-
     return demand_class, recommendation, peak_level
 
 
-# ── ROUTE 1: Health check ────────────────────────────────────
+# ── ROUTE 1: Root ────────────────────────────────────────────
 @app.get("/")
 def root():
-    # @app.get("/") = when someone visits http://localhost:8000/
-    # this function runs and returns a response
     return {
         "service": "QuickPrint Model 1 API",
         "status" : "running",
@@ -136,23 +130,16 @@ def root():
     }
 
 
-# ── ROUTE 2: Health check endpoint ──────────────────────────
+# ── ROUTE 2: Health check ────────────────────────────────────
 @app.get("/health")
 def health():
-    # simple ping to check if the server is alive
-    # your web app can call this to verify the ML service is up
     return {"status": "ok", "model": "quickprint_model1.pkl"}
 
 
 # ── ROUTE 3: Main prediction endpoint ───────────────────────
 @app.post("/predict", response_model=DemandResponse)
 def predict_demand(request: DemandRequest):
-    # @app.post("/predict") = when someone sends a POST request to /predict
-    # request: DemandRequest = FastAPI automatically validates the input
-    # response_model = FastAPI validates and formats the output
-
     try:
-        # Step 1: convert request into a pandas dataframe (1 row)
         input_data = pd.DataFrame([{
             "vendor_id"       : request.vendor_id,
             "month"           : request.month,
@@ -165,17 +152,10 @@ def predict_demand(request: DemandRequest):
             "orders_prev_3h"  : request.orders_prev_3h,
         }])
 
-        # Step 2: run the model
-        raw_prediction = model.predict(input_data)[0]
-        # model.predict() returns a numpy array — [0] gets the first value
-
-        # Step 3: round to a whole number (can't have 7.3 orders)
+        raw_prediction   = model.predict(input_data)[0]
         predicted_orders = max(0, int(round(raw_prediction)))
-
-        # Step 4: get demand class and recommendation
         demand_class, recommendation, peak_level = get_demand_info(predicted_orders)
 
-        # Step 5: return the response
         return DemandResponse(
             predicted_orders = predicted_orders,
             demand_class     = demand_class,
@@ -184,22 +164,14 @@ def predict_demand(request: DemandRequest):
         )
 
     except Exception as e:
-        # if anything goes wrong, return a proper error message
-        # HTTPException = FastAPI's way of returning error responses
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 
-# ── ROUTE 4: Batch prediction (multiple slots at once) ───────
+# ── ROUTE 4: Batch prediction ────────────────────────────────
 @app.post("/predict/batch")
 def predict_batch(requests: list[DemandRequest]):
-    # lets you send multiple requests in one API call
-    # useful for predicting the whole day at once
-
     if len(requests) > 50:
-        raise HTTPException(
-            status_code=400,
-            detail="Maximum 50 requests per batch"
-        )
+        raise HTTPException(status_code=400, detail="Maximum 50 requests per batch")
 
     results = []
     for req in requests:
@@ -234,21 +206,17 @@ def predict_batch(requests: list[DemandRequest]):
 @app.get("/predict/day/{vendor_id}")
 def predict_full_day(
     vendor_id: int,
-    month: int        = 4,
-    day_of_week: int  = 0,
+    month: int          = 4,
+    day_of_week: int    = 0,
     is_exam_period: int = 0
 ):
-    # predict all hours 8am to 8pm for one vendor in one call
-    # example: GET /predict/day/1?month=4&day_of_week=0&is_exam_period=1
-
     if vendor_id not in [1, 2, 3, 4, 5]:
         raise HTTPException(status_code=400, detail="vendor_id must be 1-5")
 
-    results = []
+    results    = []
     is_weekday = 1 if day_of_week < 5 else 0
 
     for hour in range(8, 21):
-        # for day prediction, use simple rolling estimates
         prev_1h = 5 if hour == 8 else results[-1]['predicted_orders']
         prev_3h = prev_1h * 2
 
@@ -269,20 +237,20 @@ def predict_full_day(
         demand_class, recommendation, peak_level = get_demand_info(predicted)
 
         results.append({
-            "hour"            : f"{hour:02d}:00",
+            "hour"            : hour,           # ← now a plain NUMBER (e.g. 8, 9, 10)
+            "hour_label"      : f"{hour:02d}:00",  # "08:00" for display if needed
             "predicted_orders": predicted,
             "demand_class"    : demand_class,
             "peak_level"      : peak_level
         })
 
-    # find the peak hour of the day
     peak_hour = max(results, key=lambda x: x['predicted_orders'])
 
     return {
-        "vendor_id"   : vendor_id,
-        "month"       : month,
-        "day_of_week" : day_of_week,
-        "is_exam_period": is_exam_period,
-        "peak_hour"   : peak_hour['hour'],
+        "vendor_id"      : vendor_id,
+        "month"          : month,
+        "day_of_week"    : day_of_week,
+        "is_exam_period" : is_exam_period,
+        "peak_hour"      : peak_hour['hour_label'],
         "hourly_forecast": results
     }
